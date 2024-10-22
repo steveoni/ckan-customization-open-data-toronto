@@ -1,8 +1,9 @@
-from . import api, schema, utils
-
 import ckan.plugins as p
 import ckan.plugins.toolkit as tk
 from ckan.plugins.toolkit import _
+
+from . import api, schema
+from .util import utils
 
 
 class ExtendedAPIPlugin(p.SingletonPlugin):
@@ -20,11 +21,15 @@ class ExtendedAPIPlugin(p.SingletonPlugin):
     def get_actions(self):
         return {
             "quality_show": api.quality_show,
-            "search_packages": api.query_packages,
+            "search_packages": api.search_packages,
             "search_facet": api.query_facet,
             "datastore_cache": api.datastore_cache,
             "datastore_create": api.datastore_create_hook,
             "reindex_solr": api.reindex_solr,
+            "summarize_new_intake": api.summarize_new_intake,
+            "detail_new_intake": api.detail_new_intake,
+            "detail_existing_intake": api.detail_existing_intake,
+            "prepare_intake": api.prepare_intake,
         }
 
 
@@ -60,9 +65,7 @@ class UpdateSchemaPlugin(p.SingletonPlugin):
     #   to its resources
 
     def before_create(self, context, resource):
-        package = tk.get_action("package_show")(context, {
-            "id": resource["package_id"]
-        })
+        package = tk.get_action("package_show")(context, {"id": resource["package_id"]})
 
         # throw an error if we attempt to create 2 packages with the same name
         for idx, r in enumerate(package["resources"]):

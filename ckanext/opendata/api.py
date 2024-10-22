@@ -1,32 +1,45 @@
 """'Logic for multiple Open Data Toronto-specific CKAN actions"""
 
-from ckan.logic import ValidationError
-import ckan.plugins.toolkit as tk
-from werkzeug.datastructures import FileStorage
-
-from . import utils
-from datetime import datetime
-
-import os
 import io
 import logging
+import os
+from datetime import datetime
+from typing import Dict, List
+
+import ckan.plugins.toolkit as tk
+from ckan.logic import ValidationError
+from werkzeug.datastructures import FileStorage
+
+from .util import utils
+from .util.intake import utils as intake_utils
+from .util.intake.types import (
+    DetailedIntake,
+    GroupedEntry,
+    Intakes,
+    Optional,
+    PreparedIntake,
+    RequestType,
+    SummarizedIntake,
+    SummarizeIntakesParameter,
+)
+from .util.intake.utils import search_intakes
 
 
-def build_query(query):
-    """
+def build_query(query_args: Dict[str, str]) -> str:
+    """_summary_
     Takes inputs to api calls
     maps those inputs to respective CKAN fields
     and SOLR queries and returns a valid query
 
-    Args:
-        query: Content passed from the API call from the frontend
-
-    Returns:
-        list: SOLR search params
+    :param query_args:  Content passed from the API call from the frontend
+    :type query_args: Dict[str, str]
+    :return: a Solr 'query' string
+    :rtype: str
     """
-    q = []
 
-    for k, v in query.items():  # For items in the input API call's params...
+    query = []
+
+    for k, v in query_args.items():  # For items in the input API call's params...
         if not len(v):  # ignore empty strings and non-strings
             continue
 
@@ -52,7 +65,7 @@ def build_query(query):
                 )
                 + ")"
             )
-            q.append(this)  # remove any vocab_ prefix from values
+            query.append(this)  # remove any vocab_ prefix from values
 
         elif (
             k == "search"
@@ -60,14 +73,14 @@ def build_query(query):
             for w in v.lower().split(
                 " "
             ):  # split the input by spaces, add solr syntax, add to output
-                q.append(
+                query.append(
                     "(name:(*{0}*))^5.0 OR "
                     "(tags:(*{1}*))^5.0 OR "
                     '(notes:("{1}")) OR '
                     "(title:(*{1}*))^10.0".format(w.replace(" ", "-"), w)
                 )
 
-    return q
+    return " AND ".join(["({x})".format(x=x) for x in query])
 
 
 @tk.side_effect_free
@@ -80,10 +93,7 @@ def quality_show(context, data_dict):
     if pid is None:
         raise ValidationError("Missing package ID")
 
-    package = tk.get_action("package_show")(context, {
-        "id": "catalogue-quality-scores"
-        }
-    )
+    package = tk.get_action("package_show")(context, {"id": "catalogue-quality-scores"})
 
     for r in package["resources"]:
         if r["name"] == "quality-scores-explanation-codes-and-scores":
@@ -91,11 +101,14 @@ def quality_show(context, data_dict):
             break
 
     if rid is not None:
-        return [r for r in tk.get_action("datastore_search")(
-            context,
-            {"resource_id": rid, "q": {"package": pid},
-                "sort": "recorded_at desc"},
-        )["records"] if r["package"] == pid]
+        return [
+            r
+            for r in tk.get_action("datastore_search")(
+                context,
+                {"resource_id": rid, "q": {"package": pid}, "sort": "recorded_at desc"},
+            )["records"]
+            if r["package"] == pid
+        ]
 
 
 @tk.side_effect_free
@@ -106,12 +119,12 @@ def query_facet(context, data_dict):
     of open.toronto.ca intelligently
     """
 
-    q = build_query(data_dict)
+    query = build_query(data_dict)
 
     output = tk.get_action("package_search")(
         context,
         {
-            "q": " AND ".join(["({x})".format(x=x) for x in q]),  # solr query
+            "q": query,  # solr query
             "rows": 0,  # max number of rows shown - presumably 0 is maximum
             "facet": "on",  # whether to enable faceted results
             "facet.limit": -1,  # vals a facet field can return. -1 = infinity
@@ -130,19 +143,217 @@ def query_facet(context, data_dict):
 
 
 @tk.side_effect_free
-def query_packages(context, data_dict):
+def prepare_intake(context, data_dict) -> PreparedIntake:
+    intake_tickets = intake_utils.get_intake_tickets(context)
+
+    ticket_ids = {row["Ticket Id"] for row in intake_tickets}
+
+    # group records by ticket id
+    grouped_tickets: Dict[str, List[Dict]] = {}
+    for ticket_id in ticket_ids:
+        grouped_tickets[ticket_id] = [
+            rec for rec in intake_tickets if rec["Ticket Id"] == ticket_id
+        ]
+
+    linked_tickets = intake_utils.join_linked_tickets(grouped_tickets)
+    filtered_tickets = intake_utils.filter_out_closed_tickets(linked_tickets)
+    named_ticket_groups = intake_utils.name_ticket_groups(filtered_tickets)
+
+    # partition by new/existing
+    result = {"new": {}, "existing": {}}
+    for ticket_id, ticket_group in named_ticket_groups.items():
+        ticket_request_types = [
+            ticket["Request Type"] for ticket in ticket_group["tickets"]
+        ]
+        if RequestType.UPDATE_EXISTING_OPEN_DATASET_PAGE in ticket_request_types:
+            result["existing"][ticket_id] = ticket_group
+        else:
+            result["new"][ticket_id] = ticket_group
+
+    return result
+
+
+@tk.side_effect_free
+def summarize_new_intake(
+    context, data_dict: SummarizeIntakesParameter
+) -> List[SummarizedIntake]:
+    """Returns summaries of all new, active ticket groups"""
+    output: List[SummarizedIntake] = []
+    new_intakes: Intakes = tk.get_action("prepare_intake")(context, data_dict)["new"]
+    for ticket_group_id, group in new_intakes.items():
+        # skip published datasets
+        tickets = group["tickets"]
+        ticket_group_name = group["ticket_group_name"]
+        if any([rec["To Status"] in ["Published", "Retired"] for rec in tickets]):
+            continue
+
+        # prepare to skip old and finished ticket groups
+        last_updated = max(
+            intake_utils.get_leftmost_datetime(rec, "Status Timestamp", "Created")
+            for rec in tickets
+        )
+        age = datetime.now() - last_updated
+
+        # skip closed standalone inquiry tickets
+        if (
+            any([rec["To Status"] == "Closed" for rec in tickets])
+            and all(
+                [
+                    rec["Request Type"] == RequestType.MAKE_OPEN_DATA_INQUIRY
+                    for rec in tickets
+                ]
+            )
+            and age.days > 30
+        ):
+            continue
+
+        # skip old closed publish ticket groups
+        if (
+            any(
+                [
+                    rec["To Status"] == "Closed"
+                    and rec["Request Type"] == RequestType.PUBLISH_NEW_OPEN_DATASET_PAGE
+                    for rec in tickets
+                ]
+            )
+            and age.days > 30
+        ):
+            continue
+
+        divisions = intake_utils.get_divisions_from_intake_tickets(tickets)
+        public_description = intake_utils.get_ticket_group_public_description(tickets)
+
+        recent_ticket = intake_utils.get_most_recent_ticket(tickets)
+        status = recent_ticket["To Status"] or "Identified"
+        inquiry_source = recent_ticket["Inquiry Source"]
+
+        # add summary to output
+        output.append(
+            {
+                "public_description": public_description,
+                "divisions": divisions,
+                "last_updated": last_updated,
+                "inquiry_source": inquiry_source,
+                "ticket_group_name": ticket_group_name,
+                "ticket_group_id": ticket_group_id,
+                "ticket_ids": list(set([r["Ticket Id"] for r in tickets])),
+                "status": status,
+                "ticket_count": len(set(x["Ticket Id"] for x in tickets)),
+            }
+        )
+
+    search_cleaned = data_dict.get("search", "").lower().strip()
+
+    if search_cleaned:
+        results = search_intakes(output, search_cleaned)
+    else:
+        results = sorted(output, key=lambda x: x["ticket_group_name"])
+    return results
+
+
+@tk.side_effect_free
+def detail_new_intake(context, data_dict) -> DetailedIntake:
+    """
+    input a ticket group name, output a dict with all info needed on coming soon dataset detail page
+    """
+
+    if "ticket_group_id" not in data_dict.keys():
+        raise tk.ValidationError({"constraints": ["ticket_group_id required as input"]})
+
+    ticket_group_id = data_dict["ticket_group_id"]
+
+    intake: PreparedIntake = tk.get_action("prepare_intake")(context, data_dict)[
+        "new"
+    ].get(ticket_group_id, None)
+    if not intake:
+        raise tk.ValidationError(
+            {
+                "constraints": [
+                    "Ticket Group ID {} does not exist".format(ticket_group_id)
+                ]
+            }
+        )
+
+    return intake_utils.detail_intake(intake)
+
+
+@tk.side_effect_free
+def detail_existing_intake(context, data_dict) -> DetailedIntake:
+    """detail_existing_intake
+
+    :param context: ckan context
+    :type context: Dict
+    :param data_dict: search params, must include either ticket_group_id or
+      ticket_group_name
+    :type data_dict: Dict
+    :raises tk.ValidationError: when correct search parameters are not passed.
+    :return: detailed data regarding the intake request and associated tickets.
+    :rtype: DetailedIntake
+    """
+
+    if "ticket_group_id" in data_dict:
+
+        def search_func(intakes: Intakes) -> Optional[GroupedEntry]:
+            return intakes.get(data_dict["ticket_group_id"])
+
+    elif "ticket_group_name" in data_dict:
+
+        def search_func(intakes: Intakes) -> Optional[GroupedEntry]:
+            filtered = [
+                intake
+                for intake in intakes.values()
+                if intake["ticket_group_name"] == data_dict["ticket_group_name"]
+            ]
+            if filtered:
+                return filtered[0]
+            return None
+
+    else:
+        raise tk.ValidationError(
+            {
+                "constraints": [
+                    "one of ticket_group_id or ticket_group_name are required"
+                ]
+            }
+        )
+
+    existing_intakes = tk.get_action("prepare_intake")(context, data_dict)["existing"]
+    intake = search_func(existing_intakes)
+
+    if intake is None or any(
+        [
+            rec["To Status"] in ["Published", "Closed", "Retired"]
+            and rec["Request Type"] == RequestType.UPDATE_EXISTING_OPEN_DATASET_PAGE
+            for rec in intake["tickets"]
+        ]
+    ):
+        return "Not found"
+        # TODO consider switching back to not-found (404)
+        # raise NotFound()
+
+    return intake_utils.detail_intake(intake)
+
+
+@tk.side_effect_free
+def search_packages(context, data_dict):
     """Used by the catalog page to determine which packages should be listed
     It receives inputs from filters or search terms users have selected
     on the catalog page, then returns the correct CKAN packages"""
 
-    q = build_query(data_dict)
-    params = {"rows": 10, "sort": "score desc", "start": 0}
+    query = build_query(data_dict)
+    solr_sort_expression = (
+        # is_retired='false' (or undefined) at the top, is_retired=<otherwise> at the bottom
+        # within groups:by score
+        # ie: non-retired + greatest score -> non-retired lower score -> retired
+        "or(not(exists(is_retired)),termfreq(is_retired,'false')) desc, score desc"
+    )
+    params = {"rows": 10, "sort": solr_sort_expression, "start": 0}
     params.update(data_dict)
 
     output = tk.get_action("package_search")(
         context,
         {
-            "q": " AND ".join(["({x})".format(x=x) for x in q]),  # solr query
+            "q": query,  # solr query
             "rows": params["rows"],
             "sort": params["sort"],  # this is solr specific
             "start": params[
@@ -150,6 +361,13 @@ def query_packages(context, data_dict):
             ],  # since its 0: start the returned dataset at the first record
         },
     )
+
+    intake: Intakes = tk.get_action("prepare_intake")(context, data_dict)["existing"]
+
+    intake_names = {intake["ticket_group_name"] for intake in intake.values()}
+
+    for i in range(len(output["results"])):
+        output["results"][i]["updating"] = output["results"][i]["name"] in intake_names
 
     return output
 
@@ -211,15 +429,14 @@ def datastore_cache(context, data_dict):
         }
 
     # otherwise, use input param has resource id only
-    logging.info("[ckanext-opendatatoronto]----------- Looking for resource id in data_dict")
+    logging.info(
+        "[ckanext-opendatatoronto]----------- Looking for resource id in data_dict"
+    )
     if "resource_id" in data_dict.keys() and "package_id" not in data_dict.keys():
         resource = tk.get_action("resource_show")(
             context, {"id": data_dict["resource_id"]}
         )
-        package = tk.get_action("package_show")(context, {
-            "id": resource["package_id"]
-            }
-        )
+        package = tk.get_action("package_show")(context, {"id": resource["package_id"]})
         resource_id = (
             resource["id"]
             if resource["datastore_active"] in [True, "true", "True"]
@@ -269,7 +486,9 @@ def datastore_cache(context, data_dict):
             for format in target_formats:
                 output[format.upper()] = {}
 
-            logging.info("[ckanext-opendatatoronto]=========================== CONVERTING Spatial FILE")
+            logging.info(
+                "[ckanext-opendatatoronto]=========================== CONVERTING Spatial FILE"
+            )
             logging.info(resource_info)
 
             cached_files = tk.get_action("to_file")(
@@ -295,7 +514,12 @@ def datastore_cache(context, data_dict):
                 with open(val, "rb") as f:
                     response = io.BytesIO(f.read())
                     f.close()
-                    logging.info("[ckanext-opendatatoronto]--------------- " + format + " " + epsg_code)
+                    logging.info(
+                        "[ckanext-opendatatoronto]--------------- "
+                        + format
+                        + " "
+                        + epsg_code
+                    )
 
                 try:
                     # try making a resource from scratch
@@ -311,8 +535,8 @@ def datastore_cache(context, data_dict):
                             "datastore_resource_id": resource_info["id"],
                         },
                     )
-                except Exception as e:                    
-                    
+                except Exception as e:
+
                     # otherwise, update the existing one
                     existing_resource = tk.get_action("resource_search")(
                         context, {"query": "name:{}".format(filename)}
@@ -344,7 +568,9 @@ def datastore_cache(context, data_dict):
             for format in target_formats:
                 output[format.upper()] = {}
 
-            logging.info("[ckanext-opendatatoronto]---------- CONVERTING Non Spatial FILE")
+            logging.info(
+                "[ckanext-opendatatoronto]---------- CONVERTING Non Spatial FILE"
+            )
             logging.info("[ckanext-opendatatoronto]-------------- " + format)
             cached_files = tk.get_action("to_file")(
                 context,
@@ -451,7 +677,7 @@ def datastore_create_hook(original_datastore_create, context, data_dict):
     # We dont want to hit the /datastore_cache for each chunk,
     # just the last chunk
     # The last "chunk" wont be 2000 or 20000 records in size
-    
+
     # We also have an optional "do not cache" input for datastore_create
     # if this is marked, caching wont occur after a final chunk
 
@@ -465,108 +691,42 @@ def datastore_create_hook(original_datastore_create, context, data_dict):
         )
     )
     output = original_datastore_create(context, data_dict)
-    logging.info("[ckanext-opendatatoronto]=== LOADED {} RECORDS".format(str(numrecords)))
-    if numrecords not in [2000, 1999, 20000, 19999, 0] and not data_dict.get("do_not_cache", False):
+    logging.info(
+        "[ckanext-opendatatoronto]=== LOADED {} RECORDS".format(str(numrecords))
+    )
+    if numrecords not in [2000, 1999, 20000, 19999, 0] and not data_dict.get(
+        "do_not_cache", False
+    ):
 
         context.pop("model")
         context.pop("session")
         context.pop("connection")
-        
-        #tk.enqueue_job(
-        #    fn=datastore_cache_job, 
+
+        # tk.enqueue_job(
+        #    fn=datastore_cache_job,
         #    args=[
         #        context,
         #        output["resource_id"],
-        #    ], 
+        #    ],
         #    title="cache_job - " + output["resource_id"],
         #    rq_kwargs={"timeout":3600}
         #    #title=output["resource_id"]+"_datastore_cache_job",
         #    #timeout=3600
-        #)
+        # )
         tk.get_action("datastore_cache")(
             context, {"resource_id": output["resource_id"]}
         )
-    logging.info("[ckanext-opendatatoronto]------------ Done Checking If ready for Datastore Cache")
+    logging.info(
+        "[ckanext-opendatatoronto]------------ Done Checking If ready for Datastore Cache"
+    )
 
     return output
+
 
 def datastore_cache_job(context, resource_id):
     """Calls datastore_cache CKAN action"""
 
-    tk.get_action("datastore_cache")(
-        context,
-        {"resource_id": resource_id}
-    )
-
-@tk.chained_action
-def datastore_delete_hook(original_datastore_delete, context, data_dict):
-    """This logic fires on "/datastore_delete" which is called whenever records
-    are deleted from the datastore
-
-    When this endpoint is hit, this logic ensures critical values from the tags
-    package are not deleted.
-
-    If these values are deleted, datasets will not be able to get updates
-    """
-
-    # make sure an authorized user is making this call
-    logging.info("[ckanext-opendatatoronto]------------ Checking Auth")
-    tk.check_access("datastore_delete", context, data_dict)
-    assert context[
-        "auth_user_obj"
-    ], "This endpoint can be used by authorized accounts only"
-    logging.info("[ckanext-opendatatoronto]------------ Done Checking Auth")
-
-    # checking if this targets the metadata-catalog package
-    metadata_catalog_package = tk.get_action("package_show")(
-        context, {"id": "metadata-catalog"}
-    )
-    metadata_catalog_resources = {
-        r["id"]: r["name"]
-        for r in metadata_catalog_package["resources"]
-        if r["datastore_active"] in [True, "True", "true"]
-    }
-    # if it does, make sure it doesnt target important metadata-catalog
-    if data_dict["id"] in metadata_catalog_resources.keys():
-        if metadata_catalog_resources[data_dict["id"]] in [
-            "Owner Division",
-            "Refresh Rate",
-            "Dataset Category",
-        ]:
-            # if we delete important metadata-catalog, ensure we dont delete all values
-            if "filters" not in data_dict.keys():
-                raise tk.ValidationError(
-                    {
-                        "constraints": [
-                            "Not allowed to bulk delete from {}".format(
-                                metadata_catalog_resources[data_dict["id"]]
-                            )
-                        ]
-                    }
-                )
-
-            # make sure we dont delete values belonging to the metadata-catalog package
-            elif "filters" in data_dict.keys():
-                metadata_catalog_metadata = [
-                    metadata_catalog_package["owner_division"],
-                    metadata_catalog_package["refresh_rate"],
-                    metadata_catalog_package["dataset_category"],
-                ]
-
-                incoming_deletes = data_dict["filters"].values()
-
-                matches = set(metadata_catalog_metadata) & set(incoming_deletes)
-
-                if matches:
-                    raise tk.ValidationError(
-                        {
-                            "constraints": [
-                                "Not allowed to delete tag {}".format(str(matches))
-                            ]
-                        }
-                    )
-
-    original_datastore_delete(context, data_dict)
+    tk.get_action("datastore_cache")(context, {"resource_id": resource_id})
 
 
 @tk.chained_action
