@@ -713,9 +713,9 @@ def datastore_create_hook(original_datastore_create, context, data_dict):
         #    #title=output["resource_id"]+"_datastore_cache_job",
         #    #timeout=3600
         # )
-        tk.get_action("datastore_cache")(
-            context, {"resource_id": output["resource_id"]}
-        )
+        # tk.get_action("datastore_cache")(
+        #     context, {"resource_id": output["resource_id"]}
+        # )
     logging.info(
         "[ckanext-opendatatoronto]------------ Done Checking If ready for Datastore Cache"
     )

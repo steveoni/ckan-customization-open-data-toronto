@@ -23,7 +23,7 @@ class ExtendedAPIPlugin(p.SingletonPlugin):
             "quality_show": api.quality_show,
             "search_packages": api.search_packages,
             "search_facet": api.query_facet,
-            "datastore_cache": api.datastore_cache,
+            # "datastore_cache": api.datastore_cache,
             "datastore_create": api.datastore_create_hook,
             "reindex_solr": api.reindex_solr,
             "summarize_new_intake": api.summarize_new_intake,
